@@ -1,7 +1,9 @@
 # Lobby Desktop
 
-The Lobby platform (https://lobby.gg) as a native Windows desktop app — a
-lightweight Tauri shell that opens the web app in its own window.
+The Lobby platform (https://lobby-web.vercel.app) as a native Windows desktop
+app — a lightweight Tauri shell that opens the web app in its own window.
+(Note: lobby.gg is NOT ours — when a real custom domain lands, update
+`src-tauri/tauri.conf.json` and cut a new release.)
 
 Not to be confused with [lobby-tauri](https://github.com/isthiskev/lobby-tauri),
 the Fortnite replay-upload companion tool.
