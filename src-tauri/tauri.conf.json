@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Lobby",
   "identifier": "gg.lobby.desktop",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "build": {
     "frontendDist": "../dist"
   },
@@ -13,7 +13,7 @@
         "label": "main",
         "title": "Lobby",
         "url": "https://lobby-web.vercel.app/?shell=desktop",
-        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.1.6",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.1.7",
         "width": 1536,
         "height": 864,
         "resizable": false,
