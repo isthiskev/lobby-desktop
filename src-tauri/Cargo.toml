@@ -1,6 +1,6 @@
 [package]
 name = "lobby-desktop"
-version = "0.1.3"
+version = "0.1.4"
 description = "Lobby — gaming tournaments platform, desktop app"
 edition = "2021"
 
