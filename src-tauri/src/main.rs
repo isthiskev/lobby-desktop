@@ -2,11 +2,13 @@
 //
 // The main window is created in `setup` (not declaratively in tauri.conf.json)
 // so we can attach an `on_navigation` handler. Third-party sign-in (Google,
-// Discord, Twitch, Steam, Epic) leaves our origin for the provider; in a
-// frameless window that would replace the WHOLE UI — our custom window controls
-// included — with the provider's page, stranding the user with no way back.
-// Instead we open the provider flow in its own decorated window (which has a
-// native close button = the way out) and keep the main app put.
+// Discord, Twitch, Steam, Epic) cannot run inside an embedded webview —
+// providers detect it and refuse to render (blank window). So OAuth runs in
+// the user's DEFAULT BROWSER: we cancel the in-app navigation, reopen the URL
+// externally with `platform=mobile` (the API then finishes on the same
+// `lobby://auth/callback` deep link the mobile app uses), and Windows routes
+// that link back to us — single-instance forwards it from the second process,
+// and the handler drops the token into the main webview's callback page.
 //
 // Two OS-integration preferences live in the web app's Settings screen and
 // drive the shell over IPC:
@@ -27,17 +29,14 @@ use tauri::{
     Listener, Manager, Url, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent,
 };
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_store::StoreExt;
 use sysinfo::{ProcessesToUpdate, System};
 
 const WEB_URL: &str = "https://joinlobby.gg/?shell=desktop";
 const WEB_HOST: &str = "joinlobby.gg";
-const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.2.0";
-// The auth window presents as a plain browser (no LobbyDesktop marker) so the
-// provider sees an ordinary user agent and the brief return to our callback
-// page isn't styled as the desktop shell.
-const AUTH_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.2.1";
 
 const STORE_FILE: &str = "settings.json";
 const RIB_KEY: &str = "runInBackground";
@@ -57,6 +56,14 @@ struct Settings {
 
 fn main() {
     tauri::Builder::default()
+        // Single instance MUST be registered first. A lobby:// deep link (the
+        // OAuth return) launches a second process on Windows; this forwards
+        // its argv to the running app — the "deep-link" cargo feature then
+        // delivers the URL to on_open_url — and we just refocus the window.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         // On Windows the MacosLauncher is ignored; `--minimized` is appended to
         // the registered startup command so an autostart launch can boot to the
@@ -67,8 +74,7 @@ fn main() {
         ))
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
-            // Only the main window closes to the tray; the auth window keeps its
-            // ordinary close (= cancel sign-in).
+            // Only the main window closes to the tray.
             if window.label() != "main" {
                 return;
             }
@@ -177,7 +183,6 @@ fn main() {
             let start_hidden =
                 run_in_background && std::env::args().any(|a| a == "--minimized");
 
-            let nav_handle = app.handle().clone();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(Url::parse(WEB_URL)?))
                 .title("Lobby")
                 .inner_size(1536.0, 864.0)
@@ -188,16 +193,43 @@ fn main() {
                 .visible(!start_hidden)
                 .user_agent(MAIN_UA)
                 .on_navigation(move |url| {
-                    // OAuth start hops off our origin to the API/provider. Divert
-                    // it into its own window and cancel this navigation so the
-                    // main app never leaves our UI.
+                    // OAuth start hops off our origin to the API/provider —
+                    // providers refuse to render sign-in inside an embedded
+                    // webview, so run the flow in the default browser instead.
+                    // `platform=mobile` makes the API finish on the lobby://
+                    // deep link (the mobile app's return path), which Windows
+                    // routes back to this app (see handle_deep_link).
                     if url.path().contains("/auth/oauth/") {
-                        open_auth_window(&nav_handle, url.clone());
+                        let mut browser = url.clone();
+                        let query = match browser.query() {
+                            Some(q) if !q.is_empty() => format!("{q}&platform=mobile"),
+                            _ => "platform=mobile".to_string(),
+                        };
+                        browser.set_query(Some(&query));
+                        let _ = open::that(browser.as_str());
                         return false;
                     }
                     true
                 })
                 .build()?;
+
+            // OAuth return path. The lobby:// scheme is registered with Windows
+            // by the installer (deep-link plugin config); register again at
+            // runtime so portable/dev runs work too. While the app runs, links
+            // arrive via on_open_url (forwarded by single-instance); on a cold
+            // start the launching URL sits in our own argv (get_current).
+            let _ = app.deep_link().register_all();
+            let dl_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    handle_deep_link(&dl_handle, &url);
+                }
+            });
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    handle_deep_link(app.handle(), &url);
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -471,45 +503,33 @@ fn log_debug(app: &tauri::AppHandle, games: &[String], has_token: bool) {
     }
 }
 
-/// Open (or reuse) a dedicated, decorated window that runs a provider sign-in
-/// flow. When the flow returns to the Lobby web app (the token callback, or a
-/// login/error page), the result is handed to the main window and this window
-/// closes. Closing it early simply cancels sign-in and returns to the app.
-fn open_auth_window(app: &tauri::AppHandle, url: Url) {
-    if let Some(existing) = app.get_webview_window("auth") {
-        let _ = existing.navigate(url);
-        let _ = existing.set_focus();
+/// Route a `lobby://` deep link (the OAuth return from the default browser)
+/// back into the web app inside the main window. Sign-in returns
+/// `lobby://auth/callback#token=…` — the fragment carries the session, and the
+/// web app's /auth/callback page completes the login exactly as on the web.
+/// Provider-LINK flows (from Profile) return `…?linked=…` / `…?error=…`
+/// queries instead, which belong on the profile page.
+fn handle_deep_link(app: &tauri::AppHandle, url: &Url) {
+    if url.scheme() != "lobby" {
         return;
     }
-
-    let builder_handle = app.clone();
-    let nav_handle = app.clone();
-    let _ = WebviewWindowBuilder::new(&builder_handle, "auth", WebviewUrl::External(url))
-        .title("Sign in to Lobby")
-        .inner_size(520.0, 720.0)
-        .min_inner_size(380.0, 520.0)
-        .decorations(true)
-        .center()
-        .focused(true)
-        .user_agent(AUTH_UA)
-        .on_navigation(move |u| {
-            // Back on the Lobby web app: the unique `/auth/callback` token route,
-            // or any page on our own host (e.g. `/login?error=…`).
-            let returned = u.path().starts_with("/auth/callback") || u.host_str() == Some(WEB_HOST);
-            if returned {
-                if let Some(main) = nav_handle.get_webview_window("main") {
-                    // Preserve the fragment (`#token=…`) so the main window's
-                    // callback page completes the login exactly as on the web.
-                    let target = u.as_str().replace('\\', "\\\\").replace('\'', "\\'");
-                    let _ = main.eval(&format!("window.location.replace('{target}')"));
-                    let _ = main.set_focus();
-                }
-                if let Some(auth) = nav_handle.get_webview_window("auth") {
-                    let _ = auth.close();
-                }
-                return false;
-            }
-            true
-        })
-        .build();
+    // lobby://auth/callback → host "auth", path "/callback".
+    let is_auth = url.host_str() == Some("auth") && url.path().starts_with("/callback");
+    let target = if !is_auth {
+        None
+    } else if let Some(fragment) = url.fragment() {
+        Some(format!("https://{WEB_HOST}/auth/callback#{fragment}"))
+    } else if let Some(query) = url.query() {
+        Some(format!("https://{WEB_HOST}/profile?{query}"))
+    } else {
+        None
+    };
+    if let Some(target) = target {
+        if let Some(main) = app.get_webview_window("main") {
+            let escaped = target.replace('\\', "\\\\").replace('\'', "\\'");
+            let _ = main.eval(&format!("window.location.replace('{escaped}')"));
+        }
+    }
+    // Whatever the link carried, surface the app (it may be hidden in the tray).
+    show_main(app);
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lobby-desktop"
-version = "0.2.0"
+version = "0.2.1"
 description = "Lobby — gaming tournaments platform, desktop app"
 edition = "2021"
 
@@ -12,6 +12,11 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
+# OAuth return path: the browser hands lobby:// URLs back to the app. On
+# Windows a deep link spawns a second process; single-instance (with the
+# deep-link feature) forwards it to the running app instead.
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 sysinfo = "0.33"
 ureq = "2"
 semver = "1"

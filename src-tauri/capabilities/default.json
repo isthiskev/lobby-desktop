@@ -3,7 +3,7 @@
   "description": "Main window — the Lobby web app (remote origin) renders custom window chrome (frameless shell), so it may minimize/close/drag the window, toggle launch-at-startup (autostart), and exchange the run-in-background + game-activity events. Custom app commands are not reachable from a remote origin, hence events.",
   "windows": ["main"],
   "remote": {
-    "urls": ["https://lobby-web.vercel.app"]
+    "urls": ["https://joinlobby.gg", "https://lobby-web.vercel.app"]
   },
   "permissions": [
     "core:window:allow-minimize",
