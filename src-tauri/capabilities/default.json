@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Main window — the Lobby web app renders custom window chrome (frameless shell), so it may minimize/close/drag the window. No other IPC.",
+  "description": "Main window — the Lobby web app (remote origin) renders custom window chrome (frameless shell), so it may minimize/close/drag the window, toggle launch-at-startup (autostart), and exchange the run-in-background + game-activity events. Custom app commands are not reachable from a remote origin, hence events.",
   "windows": ["main"],
   "remote": {
     "urls": ["https://lobby-web.vercel.app"]
@@ -8,6 +8,12 @@
   "permissions": [
     "core:window:allow-minimize",
     "core:window:allow-close",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit"
   ]
 }

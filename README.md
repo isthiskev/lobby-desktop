@@ -19,6 +19,19 @@ Grab the installer from the
 Windows 10/11, x64. The installer is unsigned, so SmartScreen may warn —
 choose **More info → Run anyway**.
 
+## Updates
+
+On launch the app checks the GitHub releases for a newer version (by reading the
+tag that `releases/latest` redirects to) and, if one exists, shows a native
+"Update available" dialog offering to open the download page. It asks at most
+once per new version. So **publishing a new GitHub release is all it takes** to
+prompt existing users — no manifest or signing key required.
+
+> Want fully automatic one-click updates (download + install + relaunch, no
+> manual step)? That's the Tauri updater — it needs a signing key and each
+> release to ship signed artifacts + a `latest.json`. Worth adding once releases
+> are built in CI; the current prompt is the zero-setup version.
+
 ## Development
 
 ```bash
