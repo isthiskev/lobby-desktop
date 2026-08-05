@@ -285,6 +285,12 @@ fn main() {
                         let _ = open::that(browser.as_str());
                         return false;
                     }
+                    // Any real navigation IS a fresh load — including the user
+                    // pressing the title bar's reload — so the staleness clock
+                    // restarts here rather than only when show_main resets it.
+                    if let Ok(mut t) = last_load().write() {
+                        *t = std::time::Instant::now();
+                    }
                     true
                 })
                 .build()?;
@@ -356,11 +362,46 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Reveal and focus the main window (from the tray).
+/// How long a hidden window may sit before the page it holds is assumed stale.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// When the webview last loaded the site.
+fn last_load() -> &'static RwLock<std::time::Instant> {
+    static LAST_LOAD: OnceLock<RwLock<std::time::Instant>> = OnceLock::new();
+    LAST_LOAD.get_or_init(|| RwLock::new(std::time::Instant::now()))
+}
+
+/// Show the window — and refresh it if it has been sitting.
+///
+/// "Run in the background" is ON by default, so closing HIDES to the tray rather
+/// than quitting, and reopening shows the same webview with the same page still
+/// in it. Nothing ever re-navigates. The practical effect is that every user is
+/// pinned to whichever build of the site was live the first time they launched,
+/// forever — a fix can ship, be verified live, and still be invisible in the app
+/// for weeks. That cost real time to diagnose, because the app and a browser
+/// disagree while both look correct.
+///
+/// So a window that has been away longer than STALE_AFTER reloads on its way
+/// back. Only on SHOW, which is a moment the user was elsewhere anyway — never
+/// under someone mid-task — and only after long enough that they are not going
+/// to lose anything they were in the middle of.
 fn show_main(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        let stale = last_load()
+            .read()
+            .map(|t| t.elapsed() > STALE_AFTER)
+            .unwrap_or(false);
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        if stale {
+            // location.reload() rather than a navigation: it keeps whatever page
+            // they were on instead of dropping them back at the home screen.
+            let _ = win.eval("location.reload()");
+            if let Ok(mut t) = last_load().write() {
+                *t = std::time::Instant::now();
+            }
+        }
     }
 }
 
