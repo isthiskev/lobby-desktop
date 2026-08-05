@@ -26,7 +26,8 @@ use std::sync::{OnceLock, RwLock};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Listener, Manager, Url, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent,
+    Listener, Manager, PhysicalSize, Url, WebviewUrl, WebviewWindowBuilder, Window,
+    WindowEvent,
 };
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -36,7 +37,12 @@ use sysinfo::{ProcessesToUpdate, System};
 
 const WEB_URL: &str = "https://joinlobby.gg/?shell=desktop";
 const WEB_HOST: &str = "joinlobby.gg";
-const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.2.1";
+const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.2.2";
+
+// The window is a 16:9 frame. Both numbers exist so "restore" has something
+// exact to go back to, and so the aspect lock has one place to be wrong.
+const DEFAULT_W: f64 = 1536.0;
+const DEFAULT_H: f64 = 864.0;
 
 const STORE_FILE: &str = "settings.json";
 const RIB_KEY: &str = "runInBackground";
@@ -86,6 +92,25 @@ fn main() {
                 }
                 // Otherwise let the close proceed — with no other window left,
                 // the app exits normally.
+            }
+            // LOCK THE SHAPE, NOT THE SIZE.
+            //
+            // The user drags a corner freely; we correct the height back to 16:9
+            // as it happens, so the window can be any size and only ever one
+            // proportion.
+            //
+            // The tolerance is what keeps this from looping: setting the size
+            // emits another Resized, and without a dead band the two would chase
+            // each other forever. One pixel of slack costs nothing visually and
+            // makes the correction settle in a single step.
+            if let WindowEvent::Resized(size) = event {
+                if size.width == 0 || size.height == 0 {
+                    return; // minimised — leave it alone
+                }
+                let want_h = (size.width as f64 * 9.0 / 16.0).round() as u32;
+                if want_h.abs_diff(size.height) > 1 {
+                    let _ = window.set_size(PhysicalSize::new(size.width, want_h));
+                }
             }
         })
         .setup(|app| {
@@ -143,6 +168,49 @@ fn main() {
                 }
             });
 
+            // "fit-to-screen" — our stand-in for maximize.
+            //
+            // A real maximize takes the SHAPE of the display, which is the one
+            // thing this window must not do. This grows it to the largest 16:9
+            // that fits the monitor's work area (so the taskbar still shows) and
+            // recentres; if it is already that size, it goes back to the default.
+            // Toggling, like the button it replaces.
+            //
+            // An event rather than a command because the web app is a REMOTE
+            // origin — see the note above; custom commands are not callable from
+            // it, plugin/core ones are.
+            let fit_handle = app.handle().clone();
+            app.listen("fit-to-screen", move |_| {
+                let Some(win) = fit_handle.get_webview_window("main") else { return };
+                let Ok(Some(monitor)) = win.current_monitor() else { return };
+                let scale = monitor.scale_factor();
+                let area = monitor.size();
+                // Leave a margin so the window never sits under the taskbar or
+                // hard against the screen edges.
+                let max_w = (area.width as f64 * 0.94) as u32;
+                let max_h = (area.height as f64 * 0.90) as u32;
+                // Largest 16:9 inside that box — width-led, height-capped.
+                let mut w = max_w;
+                let mut h = (w as f64 * 9.0 / 16.0).round() as u32;
+                if h > max_h {
+                    h = max_h;
+                    w = (h as f64 * 16.0 / 9.0).round() as u32;
+                }
+
+                let current = win.inner_size().unwrap_or(PhysicalSize::new(0, 0));
+                let already_fitted = current.width.abs_diff(w) <= 2;
+                let (target_w, target_h) = if already_fitted {
+                    (
+                        (DEFAULT_W * scale).round() as u32,
+                        (DEFAULT_H * scale).round() as u32,
+                    )
+                } else {
+                    (w, h)
+                };
+                let _ = win.set_size(PhysicalSize::new(target_w, target_h));
+                let _ = win.center();
+            });
+
             app.listen("set-auth-token", |event| {
                 // Payload is JSON-encoded (a quoted string); "" ⇒ signed out.
                 let token = serde_json::from_str::<String>(event.payload())
@@ -185,8 +253,16 @@ fn main() {
 
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(Url::parse(WEB_URL)?))
                 .title("Lobby")
-                .inner_size(1536.0, 864.0)
-                .resizable(false)
+                .inner_size(DEFAULT_W, DEFAULT_H)
+                // Resizable, but only in SIZE — never in shape. The window is a
+                // 16:9 frame and the app is laid out for it, so a user dragging
+                // a corner changes how big it is, not what proportion it has.
+                // Enforced in the Resized handler below.
+                .resizable(true)
+                .min_inner_size(1024.0, 576.0)
+                // Our own "maximize" is `fit_to_screen` — the largest 16:9 that
+                // fits the monitor. A real maximize would take the shape of the
+                // display, which is the one thing this window must not do.
                 .maximizable(false)
                 .decorations(false)
                 .center()
