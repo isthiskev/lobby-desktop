@@ -23,8 +23,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
+mod replay;
+
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Listener, Manager, PhysicalSize, Url, WebviewUrl, WebviewWindowBuilder, Window,
     WindowEvent,
@@ -37,7 +39,7 @@ use sysinfo::{ProcessesToUpdate, System};
 
 const WEB_URL: &str = "https://joinlobby.gg/?shell=desktop";
 const WEB_HOST: &str = "joinlobby.gg";
-const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.2.2";
+const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.3.0";
 
 // The window is a 16:9 frame. Both numbers exist so "restore" has something
 // exact to go back to, and so the aspect lock has one place to be wrong.
@@ -145,6 +147,10 @@ fn main() {
 
             build_tray(app.handle())?;
             spawn_update_check(app.handle());
+            // Fortnite replay auto-upload — the standalone "Lobby Replay" app
+            // folded in, so a competitor installs one thing and their match
+            // scores itself the moment the recording stops growing.
+            replay::start(app.handle().clone());
 
             // The web app runs from a REMOTE origin, which Tauri's ACL only lets
             // call plugin/core commands (window controls, autostart) — never our
@@ -252,7 +258,14 @@ fn main() {
                 run_in_background && std::env::args().any(|a| a == "--minimized");
 
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(Url::parse(WEB_URL)?))
-                .title("Lobby")
+                // The title bar carries the VERSION. This window is frameless
+                // and draws its own bar, so the title is the only place the
+                // build is visible — and it is the first thing worth knowing
+                // when someone reports a bug or is unsure whether an update
+                // landed. CARGO_PKG_VERSION is baked at compile time from
+                // Cargo.toml, so it cannot drift from the binary the way a
+                // hardcoded string would.
+                .title(format!("Lobby {}", env!("CARGO_PKG_VERSION")))
                 .inner_size(DEFAULT_W, DEFAULT_H)
                 // Resizable, but only in SIZE — never in shape. The window is a
                 // 16:9 frame and the app is laid out for it, so a user dragging
@@ -332,7 +345,34 @@ fn background_enabled(window: &Window) -> bool {
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show Lobby", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Lobby", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    // Replay auto-upload runs with no UI of its own, so the tray is where it
+    // reports: a disabled status line, and a manual send for a match played
+    // before the app was open (or a retry after a failure).
+    let replay_status = MenuItem::with_id(
+        app,
+        "replay_status",
+        "Replay upload: watching",
+        false,
+        None::<&str>,
+    )?;
+    let replay_now = MenuItem::with_id(
+        app,
+        "replay_now",
+        "Upload latest replay",
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &replay_status,
+            &replay_now,
+            &PredefinedMenuItem::separator(app)?,
+            &show,
+            &quit,
+        ],
+    )?;
+    replay::set_status_item(replay_status);
 
     let mut builder = TrayIconBuilder::new()
         .tooltip("Lobby")
@@ -341,6 +381,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main(app),
             "quit" => app.exit(0),
+            "replay_now" => replay::upload_latest(app.clone()),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
