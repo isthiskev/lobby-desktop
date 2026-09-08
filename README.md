@@ -21,21 +21,40 @@ choose **More info → Run anyway**.
 
 ## Updates
 
-On launch the app checks the GitHub releases for a newer version (by reading the
-tag that `releases/latest` redirects to) and, if one exists, shows a native
-"Update available" dialog offering to open the download page. It asks at most
-once per new version. So **publishing a new GitHub release is all it takes** to
-prompt existing users — no manifest or signing key required.
+The app updates itself (Tauri updater, since 0.4.0). On launch and then hourly
+(it lives in the tray for weeks) it reads the `latest.json` manifest attached
+to the newest GitHub release. If that's newer, a native dialog offers
+**Update now**: the installer is downloaded, verified against the signing key
+baked into the app, run with a passive progress UI, and Lobby restarts on the
+new version. **Later** snoozes that version for a day; a newer version always
+asks again. While hidden in the tray it never prompts — the offer waits for
+the window. If the automatic install fails it falls back to offering the
+download page.
 
-> Want fully automatic one-click updates (download + install + relaunch, no
-> manual step)? That's the Tauri updater — it needs a signing key and each
-> release to ship signed artifacts + a `latest.json`. Worth adding once releases
-> are built in CI; the current prompt is the zero-setup version.
+### Releasing
+
+1. Bump `version` in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and
+   `package.json` (keep them identical).
+2. `npm run build` — signs the artifacts with `~/.tauri/lobby-desktop.key` and
+   stages `dist-release/` (`Lobby-setup.exe`, `Lobby.msi`, `latest.json`).
+3. Create GitHub release `vX.Y.Z` and upload **all three** files.
+   `latest.json` is what running apps poll (via
+   `releases/latest/download/latest.json`) — a release without it is invisible
+   to the updater.
+
+The private key at `~/.tauri/lobby-desktop.key` (no password) is the identity
+of the update channel: lose it and shipped apps can never auto-update again
+(manual reinstall only), so keep a backup. Never commit it.
+
+Builds ≤ 0.3.0 used a zero-setup check (read the tag `releases/latest`
+redirects to, offer the download page); tagging releases `vX.Y.Z` with a
+`Lobby-setup.exe` asset keeps those users prompted too.
 
 ## Development
 
 ```bash
 npm install
-npm run dev     # run against lobby.gg in a dev window
-npm run build   # produce installers in src-tauri/target/release/bundle/
+npm run dev            # run against the live site in a dev window
+npm run build          # signed release build + dist-release/ staging
+npm run tauri build    # unsigned local build (won't be accepted by the updater)
 ```

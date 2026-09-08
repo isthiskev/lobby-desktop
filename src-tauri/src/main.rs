@@ -35,11 +35,15 @@ use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_store::StoreExt;
+use tauri_plugin_updater::UpdaterExt;
 use sysinfo::{ProcessesToUpdate, System};
 
 const WEB_URL: &str = "https://joinlobby.gg/?shell=desktop";
 const WEB_HOST: &str = "joinlobby.gg";
-const MAIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/0.3.0";
+const MAIN_UA: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 LobbyDesktop/",
+    env!("CARGO_PKG_VERSION")
+);
 
 // The window is a 16:9 frame. Both numbers exist so "restore" has something
 // exact to go back to, and so the aspect lock has one place to be wrong.
@@ -49,9 +53,15 @@ const DEFAULT_H: f64 = 864.0;
 const STORE_FILE: &str = "settings.json";
 const RIB_KEY: &str = "runInBackground";
 const AUTOSTART_INIT_KEY: &str = "autostartInitialized";
-// GitHub redirects this to the newest release's tag page (…/tag/vX.Y.Z); we read
-// the version from the redirected URL and send users here to download.
+// Manual download page — the fallback when a self-update fails (and what
+// pre-0.4 builds open). The updater proper reads the signed latest.json
+// attached to the newest release; see plugins.updater in tauri.conf.json.
 const RELEASES_LATEST_URL: &str = "https://github.com/isthiskev/lobby-desktop/releases/latest";
+// The app lives in the tray for weeks, so a launch-only update check would
+// never fire again: re-scan hourly. "Later" holds a version for a day before
+// it may be offered again — a newer version always asks straight away.
+const UPDATE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+const UPDATE_SNOOZE_SECS: u64 = 24 * 3600;
 // The Lobby API — used to pull the weekly-refreshed game-detection database.
 const API_URL: &str = "https://admin-production-6de6.up.railway.app";
 
@@ -81,6 +91,7 @@ fn main() {
             Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             // Only the main window closes to the tray.
             if window.label() != "main" {
@@ -446,79 +457,117 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
-/// On launch, check GitHub for a newer release and, if there is one, offer to
-/// open the download page. Runs off the UI thread; prompts at most once per new
-/// version (the choice is remembered so we don't nag every launch).
+/// Check for a newer release on launch and then hourly, and offer to install
+/// it in place. The updater pulls the signed `latest.json` manifest off the
+/// newest GitHub release, downloads the installer, verifies it against the
+/// pubkey baked into tauri.conf.json, runs it (passive UI), and the app comes
+/// back on the new version — no browser trip. Runs off the UI thread.
 fn spawn_update_check(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         // Let the window finish opening before we might interrupt with a dialog.
         std::thread::sleep(std::time::Duration::from_secs(3));
-
-        let Some(latest_str) = latest_release_version() else {
-            return;
-        };
-        let Ok(latest) = semver::Version::parse(&latest_str) else {
-            return;
-        };
-        let current = app.package_info().version.clone();
-        if latest <= current {
-            return; // already up to date
+        loop {
+            check_and_offer_update(&app);
+            std::thread::sleep(UPDATE_CHECK_EVERY);
         }
-        if dismissed_update(&app).as_deref() == Some(latest_str.as_str()) {
-            return; // already offered this version
-        }
-
-        let app_cb = app.clone();
-        let version_cb = latest_str.clone();
-        app.dialog()
-            .message(format!(
-                "Lobby {latest} is available — you're on {current}. Open the download page?"
-            ))
-            .title("Update available")
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Download".to_string(),
-                "Later".to_string(),
-            ))
-            .show(move |download| {
-                if download {
-                    let _ = open::that(RELEASES_LATEST_URL);
-                }
-                // Remember we've shown this version either way, so we don't ask
-                // again for it on every launch (a newer release will re-prompt).
-                set_dismissed_update(&app_cb, &version_cb);
-            });
     });
 }
 
-/// The version string of the newest GitHub release, read from the URL that
-/// `…/releases/latest` redirects to (`…/tag/vX.Y.Z`). No API token or rate-limit
-/// concerns, and no JSON parsing. `None` on any network/parse failure.
-fn latest_release_version() -> Option<String> {
-    let resp = ureq::get(RELEASES_LATEST_URL)
-        .set("User-Agent", "lobby-desktop")
-        .call()
-        .ok()?;
-    let tag = resp.get_url().rsplit('/').next()?.to_string();
-    let version = tag.strip_prefix('v').unwrap_or(&tag);
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
+/// One scan → ask → install cycle. Quietly does nothing when offline, up to
+/// date, inside a "Later" snooze, or hidden in the tray — an update dialog
+/// popping over an empty desktop (boot-to-tray launches) would read as
+/// malware, so the offer waits until the window is up and the hourly re-scan
+/// catches it.
+fn check_and_offer_update(app: &tauri::AppHandle) {
+    let Ok(updater) = app.updater() else { return };
+    let update = match tauri::async_runtime::block_on(updater.check()) {
+        Ok(Some(update)) => update,
+        _ => return, // up to date, offline, or a bad manifest — try again later
+    };
+    let version = update.version.clone();
+    if recently_dismissed(app, &version) {
+        return;
+    }
+    let visible = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(true);
+    if !visible {
+        return;
+    }
+
+    let current = app.package_info().version.clone();
+    let confirmed = app
+        .dialog()
+        .message(format!(
+            "Lobby {version} is available — you're on {current}.\n\nInstall it now? Lobby restarts itself when it's done."
+        ))
+        .title("Update available")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Update now".to_string(),
+            "Later".to_string(),
+        ))
+        .blocking_show();
+    if !confirmed {
+        set_dismissed_update(app, &version);
+        return;
+    }
+
+    match tauri::async_runtime::block_on(update.download_and_install(|_, _| {}, || {})) {
+        Ok(()) => {
+            // On Windows the installer has already taken the process down by
+            // here; restart() covers the platforms where it doesn't.
+            app.restart();
+        }
+        Err(_) => {
+            // Download/signature failure — fall back to the manual page rather
+            // than leaving a broken promise, and snooze so we don't loop.
+            set_dismissed_update(app, &version);
+            app.dialog()
+                .message(
+                    "The update could not be installed automatically. Open the download page to grab it manually?",
+                )
+                .title("Update failed")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Open download page".to_string(),
+                    "Later".to_string(),
+                ))
+                .show(|open_page| {
+                    if open_page {
+                        let _ = open::that(RELEASES_LATEST_URL);
+                    }
+                });
+        }
     }
 }
 
-fn dismissed_update(app: &tauri::AppHandle) -> Option<String> {
-    app.store(STORE_FILE)
-        .ok()?
-        .get("dismissedUpdate")?
-        .as_str()
-        .map(|s| s.to_string())
+/// True while `version` sits inside the snooze window its "Later" started.
+/// Any other version — even an older one after a rollback release — asks.
+/// (Pre-0.4 installs stored the version with no timestamp; that reads as an
+/// expired snooze, which is the right migration: offer again.)
+fn recently_dismissed(app: &tauri::AppHandle, version: &str) -> bool {
+    let Ok(store) = app.store(STORE_FILE) else {
+        return false;
+    };
+    let dismissed = store
+        .get("dismissedUpdate")
+        .and_then(|v| v.as_str().map(String::from));
+    if dismissed.as_deref() != Some(version) {
+        return false;
+    }
+    let at = store
+        .get("dismissedUpdateAt")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    now_secs().saturating_sub(at) < UPDATE_SNOOZE_SECS
 }
 
+/// Start (or refresh) the snooze window for `version`.
 fn set_dismissed_update(app: &tauri::AppHandle, version: &str) {
     if let Ok(store) = app.store(STORE_FILE) {
         store.set("dismissedUpdate", version);
+        store.set("dismissedUpdateAt", now_secs());
         let _ = store.save();
     }
 }
@@ -619,9 +668,14 @@ fn report_active_games(app: &tauri::AppHandle) {
 
 /// Whole days since the Unix epoch (UTC) — a stable per-day key for dedupe.
 fn now_day() -> u64 {
+    now_secs() / 86_400
+}
+
+/// Whole seconds since the Unix epoch.
+fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
+        .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
